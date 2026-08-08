@@ -164,6 +164,7 @@ svg{display:block;max-width:100%}
 
 <div id="syncBar"></div>
 <div id="toast"></div>
+<div id="dupes"></div>
 <div id="pending"></div>
 <div id="clearPanel"></div>
 <div id="dbxPanel"></div>
@@ -186,7 +187,7 @@ svg{display:block;max-width:100%}
    Data lives in Dropbox (via OAuth2 PKCE, no server, no app secret) with
    localStorage as an offline cache. Nothing is sent anywhere else.
    =========================================================================== */
-const APP_VERSION="v3.1";
+const APP_VERSION="v3.3";
 document.getElementById("ver").textContent = APP_VERSION;
 
 /* ---------------- constants ---------------- */
@@ -201,7 +202,7 @@ const DBX_FILE="/runs-and-walks.json";
 
 /* ---------------- state ---------------- */
 let state={
-  index:[], deleted:{}, restored:{}, showClear:false,
+  index:[], deleted:{}, restored:{}, showClear:false, dupes:[],
   tab:"overview", sportFilter:"all", range:"all", geoBusy:false, trendMetric:"pace",
   selectedId:null, year:null, pending:[], pointsCache:{},
   dbx:{appKey:"",refresh:null,account:null}, syncMsg:null, syncing:false,
@@ -234,17 +235,50 @@ function deepLocal(e,ln){if(!e)return null;const all=e.getElementsByTagName("*")
   for(let i=0;i<all.length;i++){if(all[i].tagName.split(":").pop()===ln)return all[i];}return null;}
 function numOf(e,ln){const n=deepLocal(e,ln);if(!n)return NaN;const v=parseFloat(n.textContent);return isNaN(v)?NaN:v;}
 const mean=a=>a.length?a.reduce((x,y)=>x+y,0)/a.length:null;
+/* Garmin names its exports activity_<id>.tcx — that number identifies the
+   activity itself and survives trimming or re-editing, so it is the most
+   reliable thing to match on. Timestamps are the fallback. */
+function garminIdFrom(fileName){
+  const m=/(?:activity[_-])?(\d{8,})/i.exec(String(fileName||""));
+  return m?m[1]:null;
+}
+/* Layered duplicate check:
+     same     — provably the same activity, safe to refresh in place
+     probable — looks like the same run, nothing definitive matches, so ask
+     null     — new */
+function findDuplicate(sum){
+  for(const a of state.index){
+    if(a.id===sum.id)return {kind:"same",existing:a,why:"same start time"};
+    if(sum.garminId&&a.garminId&&a.garminId===sum.garminId)
+      return {kind:"same",existing:a,why:"same Garmin activity number"};
+    if(sum.tcxId&&a.tcxId&&a.tcxId===sum.tcxId)
+      return {kind:"same",existing:a,why:"same activity id"};
+  }
+  for(const a of state.index){
+    const dt=Math.abs(new Date(a.startTime)-new Date(sum.startTime))/60000;
+    if(dt>30)continue;
+    const dd=a.distanceKm?Math.abs(a.distanceKm-sum.distanceKm)/a.distanceKm:1;
+    const du=a.durationSec?Math.abs(a.durationSec-sum.durationSec)/a.durationSec:1;
+    if(dd<=0.05&&du<=0.05){
+      const bits=[dt<1?"starts within a minute":`starts ${Math.round(dt)} min apart`,
+        `${(dd*100).toFixed(1)}% apart in distance`];
+      return {kind:"probable",existing:a,why:bits.join(", ")};
+    }
+  }
+  return null;
+}
 function countryFlag(code){if(!code||code.length!==2)return "\u{1F30D}";
   return String.fromCodePoint(...[...code.toUpperCase()].map(c=>127397+c.charCodeAt(0)));}
 
 function fmtKm(km,d=2){return km==null||isNaN(km)?"—":km.toFixed(d)+" km";}
+/* Round to whole seconds BEFORE splitting, otherwise 299.7s formats as "4:60". */
 function fmtDur(s){if(s==null||isNaN(s)||s<=0)return "—";
-  const h=Math.floor(s/3600),m=Math.floor((s%3600)/60),x=Math.round(s%60);
+  const t=Math.round(s),h=Math.floor(t/3600),m=Math.floor((t%3600)/60),x=t%60;
   return h>0?`${h}:${String(m).padStart(2,"0")}:${String(x).padStart(2,"0")}`:`${m}:${String(x).padStart(2,"0")}`;}
 function fmtPace(p){if(!p||!isFinite(p)||p<=0)return "—";
-  const m=Math.floor(p/60),s=Math.round(p%60);return `${m}:${String(s).padStart(2,"0")}/km`;}
+  const t=Math.round(p);return `${Math.floor(t/60)}:${String(t%60).padStart(2,"0")}/km`;}
 function fmtPaceShort(p){if(p==null||isNaN(p))return "";
-  const m=Math.floor(p/60),s=Math.round(p%60);return `${m}:${String(s).padStart(2,"0")}`;}
+  const t=Math.round(p);return `${Math.floor(t/60)}:${String(t%60).padStart(2,"0")}`;}
 function fmtDateShort(iso){const d=new Date(iso);return isNaN(d)?"—":`${d.getDate()} ${MONTHS[d.getMonth()]}`;}
 function fmtDateLong(iso){const d=new Date(iso);return isNaN(d)?"—":`${d.getDate()} ${MONTHS[d.getMonth()]} ${d.getFullYear()}`;}
 
@@ -255,6 +289,35 @@ function elevGain(pts){const al=pts.map(p=>p.a).filter(a=>a!=null&&!isNaN(a));
   if(al.length<2)return null;
   const sm=al.length>=20?al.map((_,i)=>{let s=0,c=0;for(let j=Math.max(0,i-2);j<=Math.min(al.length-1,i+2);j++){s+=al[j];c++;}return s/c;}):al;
   let g=0;for(let i=1;i<sm.length;i++){const d=sm[i]-sm[i-1];if(d>0)g+=d;}return Math.round(g);}
+/* Auto-pause leaves literal gaps in the trackpoint stream — the watch stops
+   recording while you stand still. Raw elapsed time therefore includes every
+   traffic light, which inflates split paces. Collapsing gaps longer than
+   PAUSE_GAP reproduces Garmin's own moving time to within a few seconds, so
+   splits, decoupling and route pace agree with the headline figure.
+   Idempotent: a second pass finds nothing left to collapse. */
+const PAUSE_GAP=5;
+function normalizeMovingTime(points){
+  let shift=0,prev=null;
+  for(const pt of points){
+    if(pt.t==null)continue;
+    if(prev!=null){
+      const gap=pt.t-prev;
+      if(gap>PAUSE_GAP)shift+=gap-1;   // leave 1s so samples still advance
+    }
+    prev=pt.t;
+    pt.t=pt.t-shift;
+  }
+  return points;
+}
+function stoppedSeconds(points){
+  let stopped=0,prev=null;
+  for(const pt of points){
+    if(pt.t==null)continue;
+    if(prev!=null&&pt.t-prev>PAUSE_GAP)stopped+=(pt.t-prev)-1;
+    prev=pt.t;
+  }
+  return stopped;
+}
 function downsample(p,m){if(p.length<=m)return p;const s=Math.ceil(p.length/m);return p.filter((_,i)=>i%s===0);}
 
 /* ---------------- parsing ---------------- */
@@ -299,6 +362,8 @@ function parseTCX(text,fileName){
       });
     });
     if(!pts.length) throw new Error("no trackpoints found in this TCX activity");
+    const stoppedSec=stoppedSeconds(pts);
+    normalizeMovingTime(pts);
     let last=0; for(const p of pts){ if(p.d==null)p.d=last; else last=p.d; }
     const lapSum=laps.reduce((s,l)=>s+(parseFloat(kidText(l,"TotalTimeSeconds"))||0),0);
     const span=pts.filter(p=>p.t!=null).slice(-1)[0]?.t||0;
@@ -309,6 +374,7 @@ function parseTCX(text,fileName){
     const sum={
       id:(start||new Date()).toISOString().replace(/[^0-9]/g,""),
       source:"tcx",fileName,startTime:(start||new Date()).toISOString(),
+      garminId:garminIdFrom(fileName),tcxId:kidText(act,"Id")||null,
       sport:sportRaw===RUN?RUN:sportRaw===BIKE?BIKE:OTHER,
       sportSource:sportRaw===OTHER?"unset":"file",
       distanceKm:km,durationSec,elevGainM:eg,
@@ -317,6 +383,7 @@ function parseTCX(text,fileName){
       avgHR:hasLapHR?Math.round(hrW/hrWt):(hrs.length?Math.round(hrs.reduce((a,b)=>a+b,0)/hrs.length):null),
       maxHR:maxL||(hrs.length?Math.max(...hrs):null),
       hasHR:hrs.length>0||hasLapHR,hasElevation:eg!=null,hasGPS:pts.some(p=>p.la!=null),
+      stoppedSec:Math.round(stoppedSec),
     };
     Object.assign(sum,deriveMetrics(pts,sum));
     return {summary:sum,points:pts};
@@ -358,18 +425,22 @@ function parseGPX(text,fileName){
       return {t:tS,d:cum,la:isNaN(p.la)?null:p.la,lo:isNaN(p.lo)?null:p.lo,
         a:p.a,h:p.h,c:p.c,s:sp,w:null};
     });
+    const gpxStopped=stoppedSeconds(pts);
+    normalizeMovingTime(pts);
     const dur=pts.filter(p=>p.t!=null).slice(-1)[0]?.t||0;
     const hrs=pts.map(p=>p.h).filter(h=>h!=null);
     const eg=elevGain(pts);
     const sum={
       id:(start||new Date()).toISOString().replace(/[^0-9]/g,""),
       source:"gpx",fileName,startTime:(start||new Date()).toISOString(),
+      garminId:garminIdFrom(fileName),tcxId:null,
       sport:sportRaw,sportSource:sportRaw===OTHER?"unset":"file",
       distanceKm:cum,durationSec:dur,elevGainM:eg,
       avgPaceSecPerKm:cum>0?dur/cum:null,calories:null,
       avgHR:hrs.length?Math.round(hrs.reduce((a,b)=>a+b,0)/hrs.length):null,
       maxHR:hrs.length?Math.max(...hrs):null,
       hasHR:hrs.length>0,hasElevation:eg!=null,hasGPS:pts.some(p=>p.la!=null),
+      stoppedSec:Math.round(gpxStopped),
     };
     Object.assign(sum,deriveMetrics(pts,sum));
     return {summary:sum,points:pts};
@@ -780,7 +851,10 @@ function loadPoints(id){
   if(state.pointsCache[id])return state.pointsCache[id];
   try{
     const v=localStorage.getItem(LS_PTS+id);
-    if(v){const p=JSON.parse(v);state.pointsCache[id]=p;return p;}
+    if(v){
+      const p=normalizeMovingTime(JSON.parse(v));   // repairs pre-v3.3 uploads too
+      state.pointsCache[id]=p;return p;
+    }
   }catch(e){}
   return null;
 }
@@ -1009,7 +1083,7 @@ async function syncNow({push=true}={}){
 
 /* ---------------- import ---------------- */
 async function importEntries(entries){
-  const ready=[],pending=[],errors=[];
+  const ready=[],pending=[],errors=[],dupes=[],replaced=[];
   for(const {name,text} of entries){
     const trimmed=text.trim();
     if(trimmed.startsWith("{")){
@@ -1017,6 +1091,8 @@ async function importEntries(entries){
       if(b&&b.kind==="garmin-analytics-backup"&&Array.isArray(b.activities)){
         b.activities.forEach(en=>{
           if(!en.summary||!en.summary.id)return;
+          const d=findDuplicate(en.summary);
+          if(d&&d.kind==="same"&&d.existing.id!==en.summary.id)return; // already present
           ready.push(en.summary);
           if(en.points&&en.points.length)savePoints(en.summary.id,en.points);
         });
@@ -1027,6 +1103,24 @@ async function importEntries(entries){
       const isGPX=/\.gpx$/i.test(name)||text.slice(0,300).toLowerCase().includes("<gpx");
       const res=isGPX?parseGPX(text,name):parseTCX(text,name);
       res.forEach(r=>{
+        const dup=findDuplicate(r.summary);
+        if(dup&&dup.kind==="same"){
+          /* Provably the same activity: refresh it under the id it already has
+             so nothing duplicates and no stored track data is orphaned. A sport
+             label or place you set by hand is preserved. */
+          const merged={...r.summary,id:dup.existing.id,
+            sport:dup.existing.sportSource==="manual"?dup.existing.sport:r.summary.sport,
+            sportSource:dup.existing.sportSource==="manual"?"manual":r.summary.sportSource,
+            place:dup.existing.place,country:dup.existing.country,
+            countryCode:dup.existing.countryCode,geoTried:dup.existing.geoTried};
+          ready.push(merged); savePoints(merged.id,r.points);
+          replaced.push({name,why:dup.why});
+          return;
+        }
+        if(dup&&dup.kind==="probable"){
+          dupes.push({summary:r.summary,points:r.points,existing:dup.existing,why:dup.why,fileName:name});
+          return;
+        }
         if(r.summary.sportSource==="unset") pending.push({summary:r.summary,points:r.points,chosen:null});
         else { ready.push(r.summary); savePoints(r.summary.id,r.points); }
       });
@@ -1043,7 +1137,8 @@ async function importEntries(entries){
     saveLocal();
   }
   if(pending.length) state.pending=state.pending.concat(pending);
-  state.toast={ok:ready.length,pending:pending.length,errors};
+  if(dupes.length) state.dupes=state.dupes.concat(dupes);
+  state.toast={ok:ready.length,pending:pending.length,errors,dupes:dupes.length,replaced};
   render();
   setTimeout(()=>{state.toast=null;render();},7000);
   queueGeocode();
@@ -1101,6 +1196,49 @@ function deleteEverything(){
   state.index=[]; state.pointsCache={}; state.backedUp=[]; state.selectedId=null;
   state.showClear=false; saveLocal(); render();
   if(state.dbx.refresh) syncNow();
+}
+function resolveDupe(entry,choice){
+  state.dupes=state.dupes.filter(x=>x!==entry);
+  if(choice==="discard"){render();return;}
+  const map=new Map(state.index.map(a=>[a.id,a]));
+  if(choice==="replace"){
+    map.delete(entry.existing.id);
+    try{localStorage.removeItem(LS_PTS+entry.existing.id);}catch(e){}
+    delete state.pointsCache[entry.existing.id];
+    state.deleted[entry.existing.id]=new Date().toISOString();
+    delete state.restored[entry.existing.id];
+  }else if(choice==="both"){
+    let id=entry.summary.id,n=2;
+    while(map.has(id))id=entry.summary.id+"-"+(n++);
+    entry.summary={...entry.summary,id};
+  }
+  delete state.deleted[entry.summary.id];
+  savePoints(entry.summary.id,entry.points);
+  map.set(entry.summary.id,entry.summary);
+  state.index=Array.from(map.values()).sort((a,b)=>new Date(b.startTime)-new Date(a.startTime));
+  saveLocal();render();queueGeocode();
+  if(state.dbx.refresh)syncNow();
+}
+function renderDupes(){
+  const host=$("dupes");if(!host)return;
+  host.innerHTML="";
+  state.dupes.forEach(dp=>{
+    const card=el("div",{class:"panel alert"});
+    card.appendChild(el("div",{style:{fontSize:"13px",fontWeight:"700"}},"Possible duplicate"));
+    card.appendChild(el("p",{class:"sub",style:{marginTop:"4px"}},
+      `${dp.fileName} looks like something already in your log — ${dp.why}. Nothing definitive matched, so it's your call.`));
+    const cmp=el("div",{class:"metgrid",style:{marginTop:"10px"}});
+    cmp.appendChild(metric("Already in your log",fmtKm(dp.existing.distanceKm,2),
+      `${fmtDateLong(dp.existing.startTime)} · ${fmtDur(dp.existing.durationSec)}`));
+    cmp.appendChild(metric("Just uploaded",fmtKm(dp.summary.distanceKm,2),
+      `${fmtDateLong(dp.summary.startTime)} · ${fmtDur(dp.summary.durationSec)}`));
+    card.appendChild(cmp);
+    card.appendChild(el("div",{class:"row-actions",style:{flexDirection:"column",alignItems:"stretch"}},
+      el("button",{class:"btn",onclick:()=>resolveDupe(dp,"discard")},"Discard the upload"),
+      el("button",{class:"btn",onclick:()=>resolveDupe(dp,"replace")},"Replace the existing one"),
+      el("button",{class:"btn btn-primary",onclick:()=>resolveDupe(dp,"both")},"Keep both — different runs")));
+    host.appendChild(card);
+  });
 }
 function confirmPending(id){
   const it=state.pending.find(p=>p.summary.id===id);
@@ -1409,6 +1547,8 @@ function viewDetail(){
   if(a.elevGainM!=null)mg.appendChild(metric("Elevation gain",Math.round(a.elevGainM)+" m",
     a.distanceKm?`${(a.elevGainM/a.distanceKm).toFixed(1)} m per km`:null));
   if(a.calories!=null)mg.appendChild(metric("Energy",a.calories+" kcal",null));
+  if(a.stoppedSec)mg.appendChild(metric("Stopped",fmtDur(a.stoppedSec),
+    `moving time ${fmtDur(a.durationSec)} — pace excludes this`));
   if(mg.children.length)v.appendChild(cardWith("Running dynamics",null,mg,
     el("p",{class:"cap"},"Vertical oscillation, vertical ratio and ground contact time aren't here — Garmin writes those only to FIT files, not TCX.")));
 
@@ -1582,6 +1722,10 @@ function renderToast(){
   const box=el("div",{class:"panel",style:{padding:"10px 12px",fontSize:"12.5px"}});
   if(t.ok)box.appendChild(el("div",null,`Imported ${t.ok} activit${t.ok===1?"y":"ies"}.`));
   if(t.pending)box.appendChild(el("div",null,`${t.pending} need${t.pending===1?"s":""} a quick tag below.`));
+  (t.replaced||[]).forEach(r=>box.appendChild(el("div",{style:{color:C.teal,marginTop:"4px"}},
+    `${r.name} was already in your log (${r.why}) — updated instead of duplicated.`)));
+  if(t.dupes)box.appendChild(el("div",{style:{color:C.clay,marginTop:"4px"}},
+    `${t.dupes} possible duplicate${t.dupes===1?"":"s"} need${t.dupes===1?"s":""} a decision below.`));
   (t.errors||[]).forEach(e=>box.appendChild(el("div",{style:{color:C.clay,marginTop:"4px"}},e)));
   host.appendChild(box);
 }
@@ -1712,9 +1856,9 @@ function render(){
   $("btnClear").className="icon-btn"+(state.showClear?" danger":"");
   $("btnClear").title="Clear data";
   renderClearPanel();
-  renderSyncBar(); renderToast(); renderPending(); renderDbxPanel(); renderPastePanel(); renderChips(); renderTabs();
+  renderSyncBar(); renderToast(); renderDupes(); renderPending(); renderDbxPanel(); renderPastePanel(); renderChips(); renderTabs();
   const main=$("main"); main.innerHTML="";
-  if(!state.index.length&&!state.pending.length){ main.appendChild(renderEmpty()); return; }
+  if(!state.index.length&&!state.pending.length&&!state.dupes.length){ main.appendChild(renderEmpty()); return; }
   if(state.tab==="overview")main.appendChild(viewOverview());
   else if(state.tab==="trends")main.appendChild(viewTrends());
   else if(state.tab==="detail")main.appendChild(viewDetail());
