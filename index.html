@@ -165,6 +165,7 @@ svg{display:block;max-width:100%}
 <div id="syncBar"></div>
 <div id="toast"></div>
 <div id="pending"></div>
+<div id="clearPanel"></div>
 <div id="dbxPanel"></div>
 <div id="pastePanel"></div>
 
@@ -185,7 +186,7 @@ svg{display:block;max-width:100%}
    Data lives in Dropbox (via OAuth2 PKCE, no server, no app secret) with
    localStorage as an offline cache. Nothing is sent anywhere else.
    =========================================================================== */
-const APP_VERSION="v3.0";
+const APP_VERSION="v3.1";
 document.getElementById("ver").textContent = APP_VERSION;
 
 /* ---------------- constants ---------------- */
@@ -195,12 +196,13 @@ const SPORT_COLOR={Running:"#C4694A",Walking:"#3E7C74",Biking:"#5B6E8C",Other:"#
 const C={bg:"#FAF8F5",surface:"#FFFFFF",charcoal:"#2A2724",muted:"#8A8177",border:"#E8E2D9",
   clay:"#C4694A",clayL:"#EBD3C7",teal:"#3E7C74",tealL:"#CFE1DD",slate:"#5B6E8C",slateL:"#D9DEE7",amber:"#C89A3C",plum:"#7A5570"};
 const MONTHS=["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
-const LS_INDEX="rw:index", LS_PTS="rw:pts:", LS_DBX="rw:dbx", LS_BACKUP="rw:lastbackup";
+const LS_INDEX="rw:index", LS_PTS="rw:pts:", LS_DBX="rw:dbx", LS_BACKUP="rw:lastbackup", LS_DEL="rw:deleted", LS_RES="rw:restored";
 const DBX_FILE="/runs-and-walks.json";
 
 /* ---------------- state ---------------- */
 let state={
-  index:[], tab:"overview", sportFilter:"all", range:"all", geoBusy:false, trendMetric:"pace",
+  index:[], deleted:{}, restored:{}, showClear:false,
+  tab:"overview", sportFilter:"all", range:"all", geoBusy:false, trendMetric:"pace",
   selectedId:null, year:null, pending:[], pointsCache:{},
   dbx:{appKey:"",refresh:null,account:null}, syncMsg:null, syncing:false,
   showDbx:false, showPaste:false, dbxStatus:null, backedUp:[],
@@ -766,6 +768,8 @@ function saveLocal(){
   try{
     localStorage.setItem(LS_INDEX,JSON.stringify(state.index));
     localStorage.setItem(LS_BACKUP,JSON.stringify(state.backedUp));
+    localStorage.setItem(LS_DEL,JSON.stringify(state.deleted));
+    localStorage.setItem(LS_RES,JSON.stringify(state.restored));
   }catch(e){}
 }
 function savePoints(id,points){
@@ -786,6 +790,10 @@ function loadLocal(){
     if(idx)state.index=JSON.parse(idx);
     const b=localStorage.getItem(LS_BACKUP);
     if(b)state.backedUp=JSON.parse(b);
+    const dl=localStorage.getItem(LS_DEL);
+    if(dl)state.deleted=JSON.parse(dl)||{};
+    const rs=localStorage.getItem(LS_RES);
+    if(rs)state.restored=JSON.parse(rs)||{};
     const d=localStorage.getItem(LS_DBX);
     if(d)state.dbx={...state.dbx,...JSON.parse(d)};
   }catch(e){}
@@ -924,14 +932,48 @@ async function dbxAccount(){
 
 function buildPayload(){
   const activities=state.index.map(s=>({summary:s,points:loadPoints(s.id)||[]}));
-  return {kind:"garmin-analytics-backup",version:1,exportedAt:new Date().toISOString(),activities};
+  return {kind:"garmin-analytics-backup",version:2,exportedAt:new Date().toISOString(),
+    activities,deleted:state.deleted,restored:state.restored};
 }
-function mergeActivities(list){
-  // union by id; local wins on conflict only if it has points and remote doesn't
+/* Merge a remote copy into the local one.
+   A plain union resurrects anything deleted locally, because "missing here"
+   and "deliberately removed here" look identical to it. Tombstones — an id
+   plus when it was deleted — tell those apart, and travel with the payload
+   so every device honours the same deletions. */
+function mergeActivities(list,remoteDeleted,remoteRestored){
+  // Re-importing a file you previously deleted is a deliberate undelete, so a
+  // restore that happened AFTER a deletion beats the tombstone. Comparing the
+  // two timestamps keeps that decision stable no matter which device syncs first.
+  if(remoteRestored&&typeof remoteRestored==="object"){
+    Object.keys(remoteRestored).forEach(id=>{
+      if(!state.restored[id]||new Date(remoteRestored[id])>new Date(state.restored[id]))
+        state.restored[id]=remoteRestored[id];
+    });
+  }
+  if(remoteDeleted&&typeof remoteDeleted==="object"){
+    Object.keys(remoteDeleted).forEach(id=>{
+      if(!state.deleted[id]||new Date(remoteDeleted[id])>new Date(state.deleted[id]))
+        state.deleted[id]=remoteDeleted[id];
+    });
+  }
+  // drop any tombstone that a later restore has overruled
+  Object.keys(state.deleted).forEach(id=>{
+    if(state.restored[id]&&new Date(state.restored[id])>new Date(state.deleted[id]))
+      delete state.deleted[id];
+  });
   const map=new Map(state.index.map(a=>[a.id,a]));
+  let removedHere=0;
+  Object.keys(state.deleted).forEach(id=>{
+    if(map.has(id)){
+      map.delete(id);removedHere++;
+      try{localStorage.removeItem(LS_PTS+id);}catch(e){}
+      delete state.pointsCache[id];
+    }
+  });
   let added=0;
   list.forEach(entry=>{
     const s=entry.summary; if(!s||!s.id)return;
+    if(state.deleted[s.id])return;            // deleted on purpose — stays gone
     if(!map.has(s.id)){map.set(s.id,s);added++;}
     else{const cur=map.get(s.id);
       if(!cur.place&&s.place)map.set(s.id,{...cur,place:s.place,country:s.country,
@@ -939,19 +981,25 @@ function mergeActivities(list){
     if(entry.points&&entry.points.length&&!(loadPoints(s.id)||[]).length) savePoints(s.id,entry.points);
   });
   state.index=Array.from(map.values()).sort((a,b)=>new Date(b.startTime)-new Date(a.startTime));
-  return added;
+  return {added,removedHere};
 }
 async function syncNow({push=true}={}){
   if(!state.dbx.refresh)return;
   state.syncing=true; render();
   try{
     const remote=await dbxDownload();
-    let added=0;
-    if(remote&&Array.isArray(remote.activities)) added=mergeActivities(remote.activities);
+    let added=0,removedHere=0;
+    if(remote&&Array.isArray(remote.activities)){
+      const r=mergeActivities(remote.activities,remote.deleted,remote.restored);
+      added=r.added; removedHere=r.removedHere;
+    }
     if(push) await dbxUpload(buildPayload());
     state.backedUp=state.index.map(a=>a.id);
     saveLocal();
-    state.syncMsg={ok:true,text:`Synced with Dropbox${added?` · ${added} pulled in`:""}`};
+    const bits=[];
+    if(added)bits.push(`${added} pulled in`);
+    if(removedHere)bits.push(`${removedHere} removed`);
+    state.syncMsg={ok:true,text:"Synced with Dropbox"+(bits.length?" · "+bits.join(", "):"")};
   }catch(e){
     state.syncMsg={ok:false,text:e.message||"Sync failed"};
   }finally{
@@ -986,7 +1034,11 @@ async function importEntries(entries){
   }
   if(ready.length){
     const map=new Map(state.index.map(a=>[a.id,a]));
-    ready.forEach(s=>map.set(s.id,s));
+    const nowIso=new Date().toISOString();
+    ready.forEach(s=>{
+      if(state.deleted[s.id]){delete state.deleted[s.id];state.restored[s.id]=nowIso;}
+      map.set(s.id,s);
+    });
     state.index=Array.from(map.values()).sort((a,b)=>new Date(b.startTime)-new Date(a.startTime));
     saveLocal();
   }
@@ -1022,6 +1074,8 @@ function cycleSport(id){
   if(state.dbx.refresh) syncNow();
 }
 function deleteActivity(id){
+  state.deleted[id]=new Date().toISOString();   // tombstone so sync can't resurrect it
+  delete state.restored[id];
   state.index=state.index.filter(a=>a.id!==id);
   try{localStorage.removeItem(LS_PTS+id);}catch(e){}
   delete state.pointsCache[id];
@@ -1030,10 +1084,23 @@ function deleteActivity(id){
   saveLocal(); render();
   if(state.dbx.refresh) syncNow();
 }
-function clearAll(){
+/* Local-only wipe. Dropbox keeps everything, so the next sync restores it —
+   useful for clearing a borrowed device or forcing a clean re-pull. */
+function resetDevice(){
   state.index.forEach(a=>{try{localStorage.removeItem(LS_PTS+a.id);}catch(e){}});
-  state.index=[]; state.pointsCache={}; state.backedUp=[]; state.selectedId=null; state.confirmClear=false;
-  saveLocal(); render();
+  state.index=[]; state.pointsCache={}; state.backedUp=[]; state.selectedId=null;
+  state.showClear=false; saveLocal(); render();
+  if(state.dbx.refresh) syncNow();
+}
+/* Real delete everywhere: tombstones every activity so the removal
+   propagates to Dropbox and every other device. */
+function deleteEverything(){
+  const now=new Date().toISOString();
+  state.index.forEach(a=>{state.deleted[a.id]=now;delete state.restored[a.id];
+    try{localStorage.removeItem(LS_PTS+a.id);}catch(e){}});
+  state.index=[]; state.pointsCache={}; state.backedUp=[]; state.selectedId=null;
+  state.showClear=false; saveLocal(); render();
+  if(state.dbx.refresh) syncNow();
 }
 function confirmPending(id){
   const it=state.pending.find(p=>p.summary.id===id);
@@ -1258,6 +1325,13 @@ function viewTrends(){
       el("p",{class:"cap"},"Consistency looks like evenly sized bubbles; gaps and spikes jump out.")));
   }
 
+  const nDel=Object.keys(state.deleted).length;
+  if(nDel)v.appendChild(el("div",{class:"card",style:{padding:"10px 14px",fontSize:"12px",color:C.muted,
+    display:"flex",alignItems:"center",justifyContent:"space-between",gap:"10px"}},
+    el("span",null,`${nDel} deleted activit${nDel===1?"y":"ies"} kept out of sync`),
+    el("button",{class:"link-btn",onclick:()=>{
+      state.deleted={};state.restored={};saveLocal();render();
+      if(state.dbx.refresh)syncNow();}},"Forget")));
   const rows=el("div");
   [...list].sort((a,b)=>new Date(b.startTime)-new Date(a.startTime)).forEach(a=>{
     const r=el("div",{class:"arow"});
@@ -1306,6 +1380,18 @@ function viewDetail(){
   [["Distance",fmtKm(a.distanceKm)],["Duration",fmtDur(a.durationSec)],["Avg pace",fmtPace(a.avgPaceSecPerKm)]]
     .forEach(([l,val])=>ds.appendChild(el("div",null,el("div",{class:"v"},val),el("div",{class:"l"},l))));
   card.appendChild(ds);
+  const delRow=el("div",{class:"row-actions",style:{marginTop:"14px"}});
+  if(state.confirmDel===a.id){
+    delRow.appendChild(el("span",{style:{fontSize:"12px",color:C.muted,marginRight:"auto",alignSelf:"center"}},
+      "Delete this activity everywhere?"));
+    delRow.appendChild(el("button",{class:"btn",onclick:()=>{state.confirmDel=null;render();}},"Cancel"));
+    delRow.appendChild(el("button",{class:"btn",style:{background:C.clay,color:"#fff",borderColor:C.clay},
+      onclick:()=>deleteActivity(a.id)},"Delete"));
+  }else{
+    delRow.appendChild(el("button",{class:"btn",style:{color:C.clay},
+      onclick:()=>{state.confirmDel=a.id;render();}},"Delete this activity"));
+  }
+  card.appendChild(delRow);
   v.appendChild(card);
 
   const mg=el("div",{class:"metgrid"});
@@ -1623,8 +1709,9 @@ function renderEmpty(){
 function render(){
   $("btnExport").hidden=!state.index.length;
   $("btnClear").hidden=!state.index.length;
-  $("btnClear").className="icon-btn"+(state.confirmClear?" danger":"");
-  $("btnClear").title=state.confirmClear?"Tap again to confirm":"Clear all data";
+  $("btnClear").className="icon-btn"+(state.showClear?" danger":"");
+  $("btnClear").title="Clear data";
+  renderClearPanel();
   renderSyncBar(); renderToast(); renderPending(); renderDbxPanel(); renderPastePanel(); renderChips(); renderTabs();
   const main=$("main"); main.innerHTML="";
   if(!state.index.length&&!state.pending.length){ main.appendChild(renderEmpty()); return; }
@@ -1637,9 +1724,27 @@ function render(){
 /* ---------------- wire-up ---------------- */
 $("fileInput").addEventListener("change",e=>{handleFiles(e.target.files);e.target.value="";});
 $("btnExport").addEventListener("click",exportBackup);
-$("btnClear").addEventListener("click",()=>{
-  if(state.confirmClear)clearAll(); else {state.confirmClear=true;render();setTimeout(()=>{state.confirmClear=false;render();},4000);}
-});
+function renderClearPanel(){
+  const host=$("clearPanel"); if(!host)return;
+  host.innerHTML="";
+  if(!state.showClear)return;
+  const n=state.index.length;
+  const card=el("div",{class:"panel alert"});
+  card.appendChild(el("p",{class:"sub"},
+    `${n} activit${n===1?"y":"ies"} on this device. Two different things you might mean:`));
+  card.appendChild(el("div",{class:"row-actions left",style:{flexDirection:"column",alignItems:"stretch"}},
+    el("button",{class:"btn",onclick:()=>exportBackup()},"Export a backup first"),
+    el("button",{class:"btn",onclick:resetDevice},
+      state.dbx.refresh?"Reset this device (Dropbox keeps everything)":"Clear this device"),
+    el("button",{class:"btn",style:{background:C.clay,color:"#fff",borderColor:C.clay},
+      onclick:deleteEverything},"Delete everything, everywhere"),
+    el("button",{class:"link-btn",style:{marginTop:"4px"},
+      onclick:()=>{state.showClear=false;render();}},"Cancel")));
+  if(state.dbx.refresh)card.appendChild(el("p",{class:"cap"},
+    "Reset clears only this device — the next sync pulls everything back from Dropbox. Delete everywhere also removes it from Dropbox and any other device."));
+  host.appendChild(card);
+}
+$("btnClear").addEventListener("click",()=>{state.showClear=!state.showClear;render();});
 $("linkDbx").addEventListener("click",()=>{state.showDbx=!state.showDbx;render();});
 $("linkPaste").addEventListener("click",()=>{state.showPaste=!state.showPaste;render();});
 
