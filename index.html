@@ -187,8 +187,14 @@ svg{display:block;max-width:100%}
    Data lives in Dropbox (via OAuth2 PKCE, no server, no app secret) with
    localStorage as an offline cache. Nothing is sent anywhere else.
    =========================================================================== */
-const APP_VERSION="v3.3";
-document.getElementById("ver").textContent = APP_VERSION;
+/* Semantic versioning: MAJOR.MINOR.PATCH
+     MAJOR — a change of platform or storage format that isn't backward compatible
+     MINOR — new capability, existing data keeps working
+     PATCH — fixes only, no new capability
+   1.x ran as a Claude artifact; 2.0.0 is the GitHub Pages rewrite. */
+const APP_VERSION="2.2.1";
+const BUILD_DATE="2026-08-08";
+document.getElementById("ver").textContent = "v"+APP_VERSION;
 
 /* ---------------- constants ---------------- */
 const RUN="Running", WALK="Walking", BIKE="Biking", OTHER="Other";
