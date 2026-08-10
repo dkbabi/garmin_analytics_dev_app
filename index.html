@@ -192,8 +192,8 @@ svg{display:block;max-width:100%}
      MINOR — new capability, existing data keeps working
      PATCH — fixes only, no new capability
    1.x ran as a Claude artifact; 2.0.0 is the GitHub Pages rewrite. */
-const APP_VERSION="2.2.1";
-const BUILD_DATE="2026-08-08";
+const APP_VERSION="2.3.0";
+const BUILD_DATE="2026-08-09";
 document.getElementById("ver").textContent = "v"+APP_VERSION;
 
 /* ---------------- constants ---------------- */
@@ -1603,6 +1603,202 @@ function viewDetail(){
   return v;
 }
 
+/* ===========================================================================
+   NEXT RUN — suggestions derived only from the last three activities.
+   Every rule states the number it fired on, so nothing is asserted that the
+   data doesn't show. Rules score themselves; the five strongest are shown.
+   =========================================================================== */
+const COACH_WINDOW=3;
+
+function splitStats(points){
+  const sp=splitsOf(points).filter(x=>!x.partial);
+  if(sp.length<3)return null;
+  const paces=sp.map(x=>x.sec);
+  const m=mean(paces);
+  const sd=Math.sqrt(mean(paces.map(v=>(v-m)*(v-m))));
+  return {mean:m,sd,n:sp.length,first:paces[0],paces};
+}
+
+function coachRules(recent){
+  const out=[];
+  const withCad=recent.filter(a=>a.avgCadence);
+  const withHR=recent.filter(a=>a.avgHR);
+  const withDec=recent.filter(a=>a.decouplingPct!=null);
+  const withNeg=recent.filter(a=>a.negSplitSec!=null);
+  const withEf=recent.filter(a=>a.efficiencyIndex!=null);
+  const n=recent.length;
+
+  /* 1. Cadence — the single most changeable form variable */
+  if(withCad.length){
+    const cad=mean(withCad.map(a=>a.avgCadence));
+    if(cad<170){
+      out.push({score:(170-cad)*3+20,tag:"Cadence",
+        finding:`Your last ${withCad.length} run${withCad.length===1?"":"s"} averaged ${Math.round(cad)} steps per minute.`,
+        action:`Try holding about ${Math.round(cad)+5} spm on your next easy run — quicker, lighter steps rather than reaching further forward. Most runners find 170–180 easiest on the joints.`});
+    }else if(cad>190){
+      out.push({score:15,tag:"Cadence",
+        finding:`You're averaging ${Math.round(cad)} spm, above the usual band.`,
+        action:"That's not a problem in itself, but if it feels frantic rather than springy, let your stride open slightly on flat sections."});
+    }
+  }
+
+  /* 2. Pacing — did the second half fade? */
+  if(withNeg.length>=2){
+    const neg=mean(withNeg.map(a=>a.negSplitSec));
+    if(neg<-8){
+      out.push({score:Math.min(Math.abs(neg),60)+30,tag:"Pacing",
+        finding:`On average your second half ran ${fmtPaceShort(Math.abs(neg))}/km slower than your first.`,
+        action:`Start your next run deliberately slower — around ${fmtPaceShort(Math.abs(neg))}/km easier than target for the first 2 km. Finishing level or faster usually gives a quicker overall time.`});
+    }else if(neg>8){
+      out.push({score:12,tag:"Pacing",
+        finding:`You're finishing faster than you start, by ${fmtPaceShort(neg)}/km on average.`,
+        action:"Good pacing discipline. There's room to start a little quicker if you're chasing a time."});
+    }
+  }
+
+  /* 3. Effort control within a run */
+  if(withDec.length){
+    const dec=mean(withDec.map(a=>a.decouplingPct));
+    if(dec>5){
+      out.push({score:dec*4+18,tag:"Endurance",
+        finding:`Speed per heartbeat dropped ${dec.toFixed(1)}% between the first and second half — anything above 5% means the effort got harder to hold.`,
+        action:"Run the next one at a pace you could hold a conversation at the whole way. Decoupling usually falls as aerobic base builds, and it also rises in heat."});
+    }
+  }
+
+  /* 4. Even pacing inside the run */
+  const stats=recent.map(a=>splitStats(loadPoints(a.id)||[])).filter(Boolean);
+  if(stats.length){
+    const sd=mean(stats.map(x=>x.sd));
+    if(sd>18){
+      out.push({score:sd+14,tag:"Consistency",
+        finding:`Your kilometre splits swing by about ${fmtPaceShort(sd)}/km either side of your average.`,
+        action:"Pick one run and hold a single pace for every kilometre, checking your watch at each split. Steady beats surging for the same effort."});
+    }
+    const fastStarts=stats.filter(x=>x.first<x.mean-12).length;
+    if(fastStarts>=2){
+      out.push({score:34,tag:"Fast starts",
+        finding:`Your first kilometre was well quicker than your average in ${fastStarts} of the last ${stats.length} runs.`,
+        action:"Treat the first kilometre as a warm-up and let it be your slowest. It usually makes the rest feel easier."});
+    }
+  }
+
+  /* 5. Are all runs sitting at the same intensity? */
+  if(withHR.length>=3){
+    const hrs=withHR.map(a=>a.avgHR);
+    const spread=Math.max(...hrs)-Math.min(...hrs);
+    const peak=Math.max(...state.index.map(a=>a.maxHR||0));
+    const avg=mean(hrs);
+    if(spread<8&&peak&&avg>peak*0.82){
+      out.push({score:32,tag:"Variety",
+        finding:`All ${withHR.length} runs sat within ${spread} bpm of each other, around ${Math.round(avg)} bpm.`,
+        action:"Everything is landing at one moderate intensity. Making one run properly easy — and letting another be genuinely hard — tends to work better than three at the same effort."});
+    }
+  }
+
+  /* 6. Efficiency trend across the window */
+  if(withEf.length>=3){
+    const asc=[...withEf].sort((a,b)=>new Date(a.startTime)-new Date(b.startTime));
+    const drop=(asc[0].efficiencyIndex-asc[asc.length-1].efficiencyIndex)/asc[0].efficiencyIndex*100;
+    if(drop>6){
+      out.push({score:drop*2+16,tag:"Recovery",
+        finding:`Metres per heartbeat fell ${drop.toFixed(0)}% across these ${asc.length} runs.`,
+        action:"Covering less ground per beat often just means accumulated tiredness. An easy day or a rest day before the next quality run is usually the fastest way forward."});
+    }
+  }
+
+  /* 7. Training load — flagged gently, this is the one that risks injury */
+  {
+    const all=[...state.index].sort((a,b)=>new Date(b.startTime)-new Date(a.startTime));
+    if(all.length>COACH_WINDOW+2){
+      const recentKm=recent.reduce((s,a)=>s+a.distanceKm,0)/recent.length;
+      const older=all.slice(COACH_WINDOW,COACH_WINDOW+5);
+      const olderKm=older.reduce((s,a)=>s+a.distanceKm,0)/older.length;
+      if(olderKm>0&&recentKm/olderKm>1.35){
+        out.push({score:38,tag:"Load",
+          finding:`Your recent runs average ${fmtKm(recentKm,1)} against ${fmtKm(olderKm,1)} before — a jump of ${Math.round((recentKm/olderKm-1)*100)}%.`,
+          action:"Sharp jumps in distance are where niggles tend to start. Holding this distance for a couple of runs before going longer is the safer way to keep the gains."});
+      }
+    }
+  }
+
+  /* 8. Step length against cadence — overstriding proxy */
+  const withStep=recent.filter(a=>a.avgStepLen&&a.avgCadence);
+  if(withStep.length){
+    const st=mean(withStep.map(a=>a.avgStepLen));
+    const cd=mean(withStep.map(a=>a.avgCadence));
+    if(cd<172&&st>1.25){
+      out.push({score:26,tag:"Stride",
+        finding:`Long steps (${st.toFixed(2)} m) at a low turnover (${Math.round(cd)} spm).`,
+        action:"That combination usually means landing with the foot ahead of your hips. Same speed, more steps — aim to land underneath yourself."});
+    }
+  }
+
+  /* 9. Terrain variety */
+  const withEl=recent.filter(a=>a.elevGainM!=null&&a.distanceKm>0);
+  if(withEl.length>=3){
+    const perKm=mean(withEl.map(a=>a.elevGainM/a.distanceKm));
+    if(perKm<4){
+      out.push({score:11,tag:"Terrain",
+        finding:`These runs averaged ${perKm.toFixed(1)} m of climb per kilometre — essentially flat.`,
+        action:"A route with some hills, or a few short uphill efforts, builds strength that flat running doesn't. Worth one run in the next few."});
+    }
+  }
+
+  /* 10. Power steadiness, when the watch records it */
+  const withPw=recent.filter(a=>a.avgPower&&a.maxPower);
+  if(withPw.length>=2){
+    const ratio=mean(withPw.map(a=>a.maxPower/a.avgPower));
+    if(ratio>1.5){
+      out.push({score:17,tag:"Power",
+        finding:`Peak power ran ${Math.round((ratio-1)*100)}% above your average — the effort came in bursts.`,
+        action:"Spikes cost more than they gain on steady runs. Easing over rises and rolling the descents keeps output flatter for the same pace."});
+    }
+  }
+  return out.sort((a,b)=>b.score-a.score).slice(0,5);
+}
+
+function viewNextRun(){
+  const v=el("div",{class:"view"});
+  const all=[...filtered()].sort((a,b)=>new Date(b.startTime)-new Date(a.startTime));
+  if(all.length<COACH_WINDOW){
+    v.appendChild(el("div",{class:"card muted-note"},
+      `Suggestions use your last ${COACH_WINDOW} activities. You have ${all.length} — upload ${COACH_WINDOW-all.length} more.`));
+    return v;
+  }
+  const recent=all.slice(0,COACH_WINDOW);
+
+  const head=el("div",{class:"card"});
+  head.appendChild(el("div",{style:{fontSize:"13px",fontWeight:"700",marginBottom:"6px"}},"Based on these three"));
+  recent.forEach(a=>head.appendChild(el("div",{style:{display:"flex",justifyContent:"space-between",
+    fontSize:"12px",padding:"5px 0",borderTop:"1px solid "+C.border}},
+    el("span",null,`${fmtDateShort(a.startTime)}${a.place?" · "+a.place:""}`),
+    el("span",{style:{color:C.muted}},
+      `${fmtKm(a.distanceKm,1)} · ${fmtPace(a.avgPaceSecPerKm)}${a.avgCadence?" · "+a.avgCadence+" spm":""}`))));
+  v.appendChild(head);
+
+  const recs=coachRules(recent);
+  if(!recs.length){
+    v.appendChild(el("div",{class:"card muted-note"},
+      "Nothing stands out across these three — pacing, cadence and effort all look consistent. Keep doing what you're doing."));
+    return v;
+  }
+  recs.forEach((r,i)=>{
+    const card=el("div",{class:"card"});
+    card.appendChild(el("div",{style:{display:"flex",alignItems:"center",gap:"8px",marginBottom:"6px"}},
+      el("span",{style:{background:C.charcoal,color:C.bg,width:"20px",height:"20px",borderRadius:"50%",
+        display:"flex",alignItems:"center",justifyContent:"center",fontSize:"11px",fontWeight:"700",
+        flex:"0 0 auto"}},String(i+1)),
+      el("span",{style:{fontSize:"13px",fontWeight:"700"}},r.tag)));
+    card.appendChild(el("p",{style:{fontSize:"12.5px",color:C.muted,lineHeight:"1.5"}},r.finding));
+    card.appendChild(el("p",{style:{fontSize:"13px",lineHeight:"1.5",marginTop:"6px"}},r.action));
+    v.appendChild(card);
+  });
+  v.appendChild(el("p",{class:"cap",style:{padding:"0 2px 8px"}},
+    "Drawn only from the numbers in these three files, and it changes as you upload new ones. General pointers, not a training plan — anything painful is worth a professional's eye rather than a chart's."));
+  return v;
+}
+
 function viewYear(){
   const v=el("div",{class:"view"});
   const ys=years();
@@ -1694,7 +1890,7 @@ function viewYear(){
 }
 
 /* ---------------- render: shell ---------------- */
-const TABS=[["overview","Overview"],["trends","Trends"],["detail","Detail"],["year","Year"]];
+const TABS=[["overview","Overview"],["trends","Trends"],["detail","Detail"],["next","Next run"],["year","Year"]];
 
 function renderSyncBar(){
   const host=$("syncBar"); host.innerHTML="";
@@ -1868,6 +2064,7 @@ function render(){
   if(state.tab==="overview")main.appendChild(viewOverview());
   else if(state.tab==="trends")main.appendChild(viewTrends());
   else if(state.tab==="detail")main.appendChild(viewDetail());
+  else if(state.tab==="next")main.appendChild(viewNextRun());
   else main.appendChild(viewYear());
 }
 
