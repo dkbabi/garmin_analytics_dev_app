@@ -192,8 +192,8 @@ svg{display:block;max-width:100%}
      MINOR — new capability, existing data keeps working
      PATCH — fixes only, no new capability
    1.x ran as a Claude artifact; 2.0.0 is the GitHub Pages rewrite. */
-const APP_VERSION="2.4.1";
-const BUILD_DATE="2026-08-19";
+const APP_VERSION="2.4.2";
+const BUILD_DATE="2026-08-20";
 document.getElementById("ver").textContent = "v"+APP_VERSION;
 
 /* ---------------- constants ---------------- */
@@ -1069,12 +1069,35 @@ async function dbxAccessToken(){
     grant_type:"refresh_token", refresh_token:state.dbx.refresh, client_id:state.dbx.appKey,
   });
   const r=await fetch("https://api.dropboxapi.com/oauth2/token",{method:"POST",body});
-  if(!r.ok) throw new Error("Could not refresh Dropbox access ("+r.status+")");
+  if(!r.ok) throw dbxError(r.status,await r.text().catch(()=>""),"sign-in refresh");
   const j=await r.json();
   state.dbx.access=j.access_token;
   state.dbx.expires=Date.now()+((j.expires_in||14400)*1000)-60000;
   saveDbx();
   return state.dbx.access;
+}
+/* Dropbox returns the same status code for very different problems, so a bare
+   "failed (401)" leaves you guessing. This turns the response into a sentence
+   that says what to change, and flags when reconnecting is the fix. */
+function dbxError(status,body,what){
+  const b=String(body||"");
+  const scope=/missing_scope/.test(b);
+  const scopeName=(/files\.content\.(read|write)/.exec(b)||[])[0];
+  if(status===401&&scope)
+    return new Error(`Dropbox is missing the ${scopeName||"files.content"} permission. Open your app in the Dropbox App Console → Permissions, tick files.content.read and files.content.write, press Submit, then disconnect and reconnect here.`);
+  if(status===401||(status===400&&/invalid_grant/.test(b)))
+    return Object.assign(new Error("Dropbox sign-in has expired or was revoked. Tap Reconnect to sign in again."),{reauth:true});
+  if(status===403&&scope)
+    return new Error(`Dropbox refused ${what} — the app lacks ${scopeName||"a required permission"}. Add it under Permissions in the App Console, press Submit, then reconnect here.`);
+  if(status===403)
+    return new Error("Dropbox refused the request. If you changed the app's permissions, disconnect and reconnect so the new ones take effect.");
+  if(status===429)
+    return new Error("Dropbox is rate limiting — too many requests at once. Wait a minute and tap Retry.");
+  if(status===507)
+    return new Error("Your Dropbox is full, so nothing new can be saved there.");
+  if(status>=500)
+    return new Error("Dropbox is having trouble at their end. Try again shortly — nothing has been lost.");
+  return new Error(`Dropbox ${what} failed (${status}). ${b.slice(0,120)}`);
 }
 async function dbxDownloadJSON(path){
   const tok=await dbxAccessToken();
@@ -1083,7 +1106,7 @@ async function dbxDownloadJSON(path){
     headers:{Authorization:"Bearer "+tok,"Dropbox-API-Arg":JSON.stringify({path})},
   });
   if(r.status===409) return null;                    // not there yet
-  if(!r.ok) throw new Error("Dropbox download failed ("+r.status+")");
+  if(!r.ok) throw dbxError(r.status,await r.text().catch(()=>""),"download");
   return JSON.parse(await r.text());
 }
 async function dbxDownload(){ return dbxDownloadJSON(DBX_FILE); }
@@ -1098,7 +1121,7 @@ async function dbxUploadJSON(path,payload){
     },
     body:JSON.stringify(payload),
   });
-  if(!r.ok) throw new Error("Dropbox upload failed ("+r.status+"): "+(await r.text()).slice(0,160));
+  if(!r.ok) throw dbxError(r.status,await r.text().catch(()=>""),"upload");
   return true;
 }
 async function dbxUpload(payload){ return dbxUploadJSON(DBX_FILE,payload); }
@@ -1241,7 +1264,11 @@ async function syncNow({push=true}={}){
     if(pushed)bits.push(`${pushed} track${pushed===1?"":"s"} uploaded`);
     state.syncMsg={ok:true,text:"Synced with Dropbox"+(bits.length?" · "+bits.join(", "):"")};
   }catch(e){
-    state.syncMsg={ok:false,text:e.message||"Sync failed"};
+    let msg=e.message||"Sync failed";
+    if(/failed to fetch|networkerror|load failed/i.test(msg))
+      msg="Couldn't reach Dropbox. Check your connection — your activities are safe on this device and will sync when you're back online.";
+    state.syncMsg={ok:false,text:msg,reauth:!!e.reauth};
+    if(e.reauth)state.showDbx=true;
   }finally{
     state.syncing=false; render();
   }
@@ -2063,7 +2090,9 @@ function renderSyncBar(){
   if(state.syncMsg){
     host.appendChild(el("div",{class:"sync-bar "+(state.syncMsg.ok?"ok":"warn")},
       el("span",{class:"txt"},state.syncMsg.text),
-      el("button",{onclick:()=>syncNow()},"Sync")));
+      state.syncMsg.reauth
+        ? el("button",{onclick:()=>{state.showDbx=true;state.syncMsg=null;render();}},"Reconnect")
+        : el("button",{onclick:()=>syncNow()},"Retry")));
     return;
   }
   if(state.dbx.refresh){
