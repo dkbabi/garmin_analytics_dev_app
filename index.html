@@ -192,7 +192,7 @@ svg{display:block;max-width:100%}
      MINOR — new capability, existing data keeps working
      PATCH — fixes only, no new capability
    1.x ran as a Claude artifact; 2.0.0 is the GitHub Pages rewrite. */
-const APP_VERSION="2.4.2";
+const APP_VERSION="2.4.3";
 const BUILD_DATE="2026-08-20";
 document.getElementById("ver").textContent = "v"+APP_VERSION;
 
@@ -210,7 +210,7 @@ const DBX_ACT=id=>`/activities/${id}.json`;     // one file per activity track
 
 /* ---------------- state ---------------- */
 let state={
-  index:[], deleted:{}, restored:{}, showClear:false, dupes:[],
+  index:[], deleted:{}, restored:{}, showClear:false, dupes:[], diag:null, diagDone:false,
   tab:"overview", sportFilter:"all", range:"all", geoBusy:false, trendMetric:"pace",
   selectedId:null, year:null, pending:[], pointsCache:{},
   dbx:{appKey:"",refresh:null,account:null}, syncMsg:null, syncing:false,
@@ -1125,14 +1125,17 @@ async function dbxUploadJSON(path,payload){
   return true;
 }
 async function dbxUpload(payload){ return dbxUploadJSON(DBX_FILE,payload); }
+/* application/json triggers a CORS preflight, which browsers can fail silently
+   and which Dropbox's own docs advise avoiding. Passing the argument in the URL
+   with a text/plain body keeps this a "simple" request, so no preflight. */
 async function dbxDelete(path){
   const tok=await dbxAccessToken();
   try{
-    await fetch("https://api.dropboxapi.com/2/files/delete_v2",{
-      method:"POST",
-      headers:{Authorization:"Bearer "+tok,"Content-Type":"application/json"},
-      body:JSON.stringify({path}),
-    });
+    const u="https://api.dropboxapi.com/2/files/delete_v2?arg="+
+      encodeURIComponent(JSON.stringify({path}));
+    await fetch(u,{method:"POST",
+      headers:{Authorization:"Bearer "+tok,
+        "Content-Type":"text/plain; charset=dropbox-cors-hack"}});
   }catch(e){ /* already gone, or offline — the manifest is what matters */ }
 }
 async function dbxAccount(){
@@ -1266,7 +1269,7 @@ async function syncNow({push=true}={}){
   }catch(e){
     let msg=e.message||"Sync failed";
     if(/failed to fetch|networkerror|load failed/i.test(msg))
-      msg="Couldn't reach Dropbox. Check your connection — your activities are safe on this device and will sync when you're back online.";
+      msg="The request never reached Dropbox. If you're online, this is usually a content blocker, VPN or strict tracking protection getting in the way — open Dropbox sync and tap Test connection to see which step fails. Your activities are safe on this device either way.";
     state.syncMsg={ok:false,text:msg,reauth:!!e.reauth};
     if(e.reauth)state.showDbx=true;
   }finally{
@@ -2147,6 +2150,41 @@ function renderPending(){
     host.appendChild(card);
   });
 }
+/* Runs each Dropbox call in turn so a failure can be pinned to a step rather
+   than reported as a blanket "couldn't reach Dropbox". */
+async function dbxDiagnose(){
+  const out=[];
+  const note=(step,ok,msg)=>{out.push({step,ok,msg});state.diag=out.slice();render();};
+  state.diag=[{step:"Running checks…",ok:null}];state.diagDone=false;render();
+  try{
+    await fetch("https://www.dropbox.com/favicon.ico",{mode:"no-cors",cache:"no-store"});
+    note("Reaching dropbox.com",true);
+  }catch(e){
+    note("Reaching dropbox.com",false,
+      "The browser couldn't reach Dropbox at all. A content blocker, VPN, private relay or strict tracking protection will do this — try disabling content blockers for this site, or another network.");
+    state.diagDone=true;render();return;
+  }
+  let tok=null;
+  try{ tok=await dbxAccessToken(); note("Renewing sign-in",true); }
+  catch(e){ note("Renewing sign-in",false,e.message); state.diagDone=true;render(); return; }
+  try{
+    const r=await fetch("https://content.dropboxapi.com/2/files/download",{method:"POST",
+      headers:{Authorization:"Bearer "+tok,"Dropbox-API-Arg":JSON.stringify({path:DBX_MANIFEST})}});
+    if(r.ok||r.status===409)note("Reading from Dropbox",true,
+      r.status===409?"No manifest there yet — normal before the first sync.":"");
+    else note("Reading from Dropbox",false,dbxError(r.status,await r.text().catch(()=>""),"download").message);
+  }catch(e){ note("Reading from Dropbox",false,"The request never completed — usually a content blocker or network filter."); }
+  try{
+    const r=await fetch("https://content.dropboxapi.com/2/files/upload",{method:"POST",
+      headers:{Authorization:"Bearer "+tok,
+        "Dropbox-API-Arg":JSON.stringify({path:"/.connection-check.json",mode:"overwrite",mute:true}),
+        "Content-Type":"application/octet-stream"},
+      body:JSON.stringify({checkedAt:new Date().toISOString()})});
+    if(r.ok){note("Writing to Dropbox",true); dbxDelete("/.connection-check.json");}
+    else note("Writing to Dropbox",false,dbxError(r.status,await r.text().catch(()=>""),"upload").message);
+  }catch(e){ note("Writing to Dropbox",false,"The request never completed — usually a content blocker or network filter."); }
+  state.diagDone=true;render();
+}
 function renderDbxPanel(){
   const host=$("dbxPanel"); host.innerHTML="";
   if(!state.showDbx)return;
@@ -2156,6 +2194,7 @@ function renderDbxPanel(){
       `Connected${state.dbx.account?" as "+state.dbx.account:""}. Your activities live in Apps/(your app folder)/runs-and-walks.json in Dropbox and sync automatically.`));
     card.appendChild(el("div",{class:"row-actions left"},
       el("button",{class:"btn btn-primary",onclick:()=>syncNow()},"Sync now"),
+      el("button",{class:"btn",onclick:()=>dbxDiagnose()},"Test connection"),
       el("button",{class:"btn",onclick:()=>{
         state.dbx={appKey:"",refresh:null,account:null}; saveDbx(); state.syncMsg=null; render();
       }},"Disconnect")));
@@ -2168,12 +2207,25 @@ function renderDbxPanel(){
       oninput:e=>{state.dbx.appKey=e.target.value.trim();}});
     card.appendChild(inp);
     card.appendChild(el("div",{class:"row-actions left"},
+      el("button",{class:"btn",onclick:()=>dbxDiagnose()},"Test connection"),
       el("button",{class:"btn btn-primary",onclick:async()=>{
         const k=(inp.value||"").trim();
         if(!k){state.dbxStatus={ok:false,text:"Enter your App key first."};render();return;}
         try{ await dbxStartAuth(k); }
         catch(e){ state.dbxStatus={ok:false,text:e.message}; render(); }
       }},"Connect Dropbox")));
+  }
+  if(state.diag){
+    const box=el("div",{style:{marginTop:"10px"}});
+    state.diag.forEach(dg=>{
+      box.appendChild(el("div",{style:{fontSize:"12px",padding:"6px 0",
+        borderTop:"1px solid "+C.border}},
+        el("div",{style:{fontWeight:"700",
+          color:dg.ok===null?C.muted:(dg.ok?C.teal:C.clay)}},
+          (dg.ok===null?"… ":(dg.ok?"✓ ":"✕ "))+dg.step),
+        dg.msg?el("div",{style:{color:C.muted,marginTop:"3px",lineHeight:"1.45"}},dg.msg):null));
+    });
+    card.appendChild(box);
   }
   if(state.dbxStatus) card.appendChild(el("p",{class:"status "+(state.dbxStatus.ok?"ok":"err")},state.dbxStatus.text));
   host.appendChild(card);
