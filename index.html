@@ -142,6 +142,11 @@ select.sel{width:100%;appearance:none;-webkit-appearance:none;padding:11px 34px 
 .country-row .cnt{font-size:11px;color:var(--muted)}
 .arow .place{font-size:10px;color:var(--muted)}
 svg{display:block;max-width:100%}
+.mapbox{width:100%;height:260px;border-radius:12px;overflow:hidden;background:var(--bg);
+  border:1px solid var(--border)}
+.leaflet-container{font-family:'Albert Sans',system-ui,sans-serif;background:var(--bg)}
+.map-toggle{display:flex;gap:6px;margin-bottom:8px}
+.map-note{font-size:11px;color:var(--muted);margin-top:6px;line-height:1.45}
 </style>
 </head>
 <body>
@@ -192,7 +197,7 @@ svg{display:block;max-width:100%}
      MINOR — new capability, existing data keeps working
      PATCH — fixes only, no new capability
    1.x ran as a Claude artifact; 2.0.0 is the GitHub Pages rewrite. */
-const APP_VERSION="2.4.6";
+const APP_VERSION="2.5.0";
 const BUILD_DATE="2026-08-20";
 document.getElementById("ver").textContent = "v"+APP_VERSION;
 
@@ -211,6 +216,7 @@ const DBX_ACT=id=>`/activities/${id}.json`;     // one file per activity track
 /* ---------------- state ---------------- */
 let state={
   index:[], deleted:{}, restored:{}, showClear:false, dupes:[], diag:null, diagDone:false,
+  mapMode:"map",
   tab:"overview", sportFilter:"all", range:"all", geoBusy:false, trendMetric:"pace",
   selectedId:null, year:null, pending:[], pointsCache:{},
   dbx:{appKey:"",refresh:null,account:null}, syncMsg:null, syncing:false,
@@ -797,6 +803,77 @@ function lineChart(data,{h=150,color=C.slate,fill=null,fmt=v=>v.toFixed(1),yFmt=
   return svg;
 }
 
+/* ---------------- map ----------------
+   Leaflet with OpenStreetMap tiles: no API key, no billing, no account — which
+   matters for a static page with no server. Google Maps needs a billable key and
+   Apple MapKit JS needs server-side token signing, so neither fits here. Loaded
+   lazily, only when a map is shown, so nothing else is slowed and offline use
+   still works through the drawn fallback. */
+const LEAFLET_CSS="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";
+const LEAFLET_JS="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
+let leafletP=null;
+function loadLeaflet(){
+  if(window.L)return Promise.resolve(window.L);
+  if(leafletP)return leafletP;
+  leafletP=new Promise((res,rej)=>{
+    const timer=setTimeout(()=>rej(new Error("timeout")),12000);
+    const css=document.createElement("link");
+    css.rel="stylesheet";css.href=LEAFLET_CSS;document.head.appendChild(css);
+    const js=document.createElement("script");
+    js.src=LEAFLET_JS;
+    js.onload=()=>{clearTimeout(timer);res(window.L);};
+    js.onerror=()=>{clearTimeout(timer);rej(new Error("blocked"));};
+    document.head.appendChild(js);
+  });
+  return leafletP;
+}
+/* One polyline can only be a single colour, so the track is split into short
+   segments, each carrying its own pace colour. */
+function paceSegments(points){
+  const pts=downsample(points,220).filter(p=>p.la!=null&&p.lo!=null);
+  if(pts.length<2)return null;
+  const paces=[];
+  for(let i=1;i<pts.length;i++){
+    const dd=pts[i].d-pts[i-1].d,dt=pts[i].t-pts[i-1].t;
+    paces.push(dd>0&&dt>0?dt/dd:null);
+  }
+  const ok=paces.filter(x=>x!=null);
+  return {pts,paces,avg:ok.length?mean(ok):null};
+}
+function renderMap(host,points){
+  const seg=paceSegments(points);
+  if(!seg){host.appendChild(el("div",{class:"muted-note"},"No GPS track in this activity."));return;}
+  const box=el("div",{class:"mapbox"});
+  host.appendChild(box);
+  loadLeaflet().then(L=>{
+    const map=L.map(box,{scrollWheelZoom:false});
+    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png",{
+      maxZoom:19,
+      referrerPolicy:"strict-origin-when-cross-origin",   // required by OSM's tile policy
+      attribution:'&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+    }).addTo(map);
+    const {pts,paces,avg}=seg;
+    for(let i=1;i<pts.length;i++){
+      const pace=paces[i-1];
+      let col=C.muted;
+      if(pace!=null&&avg)col=pace<avg*0.93?C.teal:pace>avg*1.07?C.clay:"#B9A88E";
+      L.polyline([[pts[i-1].la,pts[i-1].lo],[pts[i].la,pts[i].lo]],
+        {color:col,weight:5,opacity:.9}).addTo(map);
+    }
+    const a=pts[0],b=pts[pts.length-1];
+    L.circleMarker([a.la,a.lo],{radius:7,color:C.charcoal,weight:3,
+      fillColor:"#fff",fillOpacity:1}).addTo(map).bindPopup("Start");
+    L.circleMarker([b.la,b.lo],{radius:7,color:C.charcoal,weight:3,
+      fillColor:C.charcoal,fillOpacity:1}).addTo(map).bindPopup("Finish");
+    map.fitBounds(L.latLngBounds(pts.map(p=>[p.la,p.lo])),{padding:[24,24]});
+    setTimeout(()=>map.invalidateSize(),80);   // container is sized after insertion
+  }).catch(()=>{
+    box.remove();
+    host.appendChild(routePaced(points));
+    host.appendChild(el("p",{class:"map-note"},
+      "Showing the plain route — the map couldn't load, usually because you're offline."));
+  });
+}
 function projectRoute(points,W,H,pad){
   const pts=points.filter(p=>p.la!=null&&p.lo!=null&&!isNaN(p.la)&&!isNaN(p.lo));
   if(pts.length<2)return null;
@@ -990,6 +1067,8 @@ function loadLocal(){
     if(rs)state.restored=JSON.parse(rs)||{};
     const d=localStorage.getItem(LS_DBX);
     if(d)state.dbx={...state.dbx,...JSON.parse(d)};
+    const mm=localStorage.getItem("rw:mapmode");
+    if(mm)state.mapMode=mm;
   }catch(e){}
 }
 /* ---- reverse geocoding via OpenStreetMap Nominatim ----
@@ -1801,7 +1880,26 @@ function viewDetail(){
   const card=el("div",{class:"card"});
   if(a.place||a.country)card.appendChild(el("div",{style:{fontSize:"12px",color:C.muted,marginBottom:"8px"}},
     `${countryFlag(a.countryCode)} ${a.place||""}${a.place&&a.country?", ":""}${a.country||""}`));
-  card.appendChild(routePaced(pts));
+  const hasGPS=pts.length&&pts.some(p=>p.la!=null);
+  if(hasGPS){
+    const toggle=el("div",{class:"map-toggle"});
+    [["map","Map"],["plain","Route only"]].forEach(([mode,lbl])=>{
+      toggle.appendChild(el("button",{class:"chip"+(state.mapMode===mode?" active":""),
+        onclick:()=>{state.mapMode=mode;
+          try{localStorage.setItem("rw:mapmode",mode);}catch(e){}
+          render();}},lbl));
+    });
+    card.appendChild(toggle);
+  }
+  const mapWrap=el("div");
+  if(hasGPS&&state.mapMode==="map"){
+    renderMap(mapWrap,pts);
+    mapWrap.appendChild(el("p",{class:"map-note"},
+      "Teal where you ran faster than this activity's average, clay where slower. Pinch to zoom."));
+  }else{
+    mapWrap.appendChild(routePaced(pts));
+  }
+  card.appendChild(mapWrap);
   const ds=el("div",{class:"dstats"});
   [["Distance",fmtKm(a.distanceKm)],["Duration",fmtDur(a.durationSec)],["Avg pace",fmtPace(a.avgPaceSecPerKm)]]
     .forEach(([l,val])=>ds.appendChild(el("div",null,el("div",{class:"v"},val),el("div",{class:"l"},l))));
