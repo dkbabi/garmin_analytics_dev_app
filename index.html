@@ -192,7 +192,7 @@ svg{display:block;max-width:100%}
      MINOR — new capability, existing data keeps working
      PATCH — fixes only, no new capability
    1.x ran as a Claude artifact; 2.0.0 is the GitHub Pages rewrite. */
-const APP_VERSION="2.4.5";
+const APP_VERSION="2.4.6";
 const BUILD_DATE="2026-08-20";
 document.getElementById("ver").textContent = "v"+APP_VERSION;
 
@@ -881,32 +881,46 @@ function decodeTrack(enc){
    practical ceiling here. Summaries stay in localStorage: small, and wanted
    synchronously during render. */
 let idbP=null;
+/* indexedDB.open fires "blocked" when the same database is already open in
+   another tab — an easy accident: a Safari tab plus the Home Screen app. Then
+   neither success nor error ever fires, so a promise waiting only on those two
+   never settles, and everything awaiting it hangs indefinitely. Handle blocked,
+   and time out regardless so nothing waits forever. */
+let idbBlocked=false;
 function idb(){
   if(idbP)return idbP;
   idbP=new Promise(res=>{
+    let settled=false;
+    const done=v=>{if(!settled){settled=true;res(v);}};
+    const timer=setTimeout(()=>{idbBlocked=true;done(null);},6000);
     try{
       const rq=indexedDB.open("runs-and-walks",1);
       rq.onupgradeneeded=()=>{const db=rq.result;
         if(!db.objectStoreNames.contains("tracks"))db.createObjectStore("tracks");};
-      rq.onsuccess=()=>res(rq.result);
-      rq.onerror=()=>res(null);
-    }catch(e){res(null);}
+      rq.onsuccess=()=>{clearTimeout(timer);done(rq.result);};
+      rq.onerror=()=>{clearTimeout(timer);done(null);};
+      rq.onblocked=()=>{clearTimeout(timer);idbBlocked=true;done(null);};
+    }catch(e){clearTimeout(timer);done(null);}
   });
   return idbP;
 }
+/* Any single IndexedDB request can also stall; never wait on one forever. */
+function idbTimeout(promise,ms=6000,fallback=null){
+  return Promise.race([promise,new Promise(r=>setTimeout(()=>r(fallback),ms))]);
+}
 async function idbGet(id){
   const db=await idb(); if(!db)return null;
-  return new Promise(res=>{try{
+  return idbTimeout(new Promise(res=>{try{
     const r=db.transaction("tracks","readonly").objectStore("tracks").get(id);
     r.onsuccess=()=>res(r.result||null); r.onerror=()=>res(null);
-  }catch(e){res(null);}});
+  }catch(e){res(null);}}));
 }
 async function idbSet(id,val){
   const db=await idb(); if(!db)return false;
-  return new Promise(res=>{try{
+  return idbTimeout(new Promise(res=>{try{
     const r=db.transaction("tracks","readwrite").objectStore("tracks").put(val,id);
     r.onsuccess=()=>res(true); r.onerror=()=>res(false);
-  }catch(e){res(false);}});
+  }catch(e){res(false);}}),6000,false);
 }
 async function idbDel(id){
   const db=await idb(); if(!db)return;
@@ -1051,7 +1065,7 @@ async function dbxExchangeCode(code){
     code, grant_type:"authorization_code", client_id:appKey,
     code_verifier:verifier, redirect_uri:redirectUri(),
   });
-  const r=await fetch("https://api.dropboxapi.com/oauth2/token",{method:"POST",body});
+  const r=await fetchT("https://api.dropboxapi.com/oauth2/token",{method:"POST",body},20000);
   if(!r.ok) throw new Error("Token exchange failed ("+r.status+"): "+(await r.text()).slice(0,160));
   const j=await r.json();
   state.dbx.appKey=appKey;
@@ -1068,7 +1082,7 @@ async function dbxAccessToken(){
   const body=new URLSearchParams({
     grant_type:"refresh_token", refresh_token:state.dbx.refresh, client_id:state.dbx.appKey,
   });
-  const r=await fetch("https://api.dropboxapi.com/oauth2/token",{method:"POST",body});
+  const r=await fetchT("https://api.dropboxapi.com/oauth2/token",{method:"POST",body},20000);
   if(!r.ok) throw dbxError(r.status,await r.text().catch(()=>""),"sign-in refresh");
   const j=await r.json();
   state.dbx.access=j.access_token;
@@ -1101,15 +1115,29 @@ function dbxError(status,body,what){
 }
 async function dbxDownloadJSON(path){
   const tok=await dbxAccessToken();
-  const r=await fetch("https://content.dropboxapi.com/2/files/download",{
+  const r=await fetchT("https://content.dropboxapi.com/2/files/download",{
     method:"POST",
     headers:{Authorization:"Bearer "+tok,"Dropbox-API-Arg":JSON.stringify({path})},
-  });
+  },45000);
   if(r.status===409) return null;                    // not there yet
   if(!r.ok) throw dbxError(r.status,await r.text().catch(()=>""),"download of "+path);
   return JSON.parse(await r.text());
 }
 async function dbxDownload(){ return dbxDownloadJSON(DBX_FILE); }
+/* A stalled request neither resolves nor rejects, so every Dropbox call needs a
+   deadline. Uploads get longer than reads because they carry more data. */
+async function fetchT(url,opts={},ms=30000){
+  if(typeof AbortController==="undefined")return fetch(url,opts);
+  const ac=new AbortController();
+  const timer=setTimeout(()=>ac.abort(),ms);
+  try{ return await fetch(url,{...opts,signal:ac.signal}); }
+  catch(e){
+    if(e.name==="AbortError")
+      throw new Error("Dropbox stopped responding after "+Math.round(ms/1000)+" seconds");
+    throw e;
+  }
+  finally{ clearTimeout(timer); }
+}
 let dbxLastStep="";
 function step(x){dbxLastStep=x;return x;}
 /* Mobile Safari drops individual requests under memory pressure or when the tab
@@ -1130,7 +1158,7 @@ async function withRetry(fn,tries=3){
 }
 async function dbxUploadJSON(path,payload){
   const tok=await dbxAccessToken();
-  const r=await fetch("https://content.dropboxapi.com/2/files/upload",{
+  const r=await fetchT("https://content.dropboxapi.com/2/files/upload",{
     method:"POST",
     headers:{
       Authorization:"Bearer "+tok,
@@ -1138,7 +1166,7 @@ async function dbxUploadJSON(path,payload){
       "Content-Type":"application/octet-stream",
     },
     body:JSON.stringify(payload),
-  });
+  },60000);
   if(!r.ok) throw dbxError(r.status,await r.text().catch(()=>""),"upload of "+path);
   return true;
 }
@@ -1224,9 +1252,25 @@ function mergeActivities(list,remoteDeleted,remoteRestored){
    per activity in each direction, so fifty activities meant ~22 MB each way to
    change a single label. Tracks never change once written, so they upload once
    and are fetched only when a view needs them. */
+let syncRunning=false;
 async function syncNow({push=true}={}){
   if(!state.dbx.refresh)return;
-  state.syncing=true; render();
+  if(syncRunning){                      // a second tap shouldn't stack another run
+    state.syncMsg={ok:true,text:"Already syncing…"};render();return;
+  }
+  syncRunning=true;
+  state.syncing=true; state.syncMsg=null; render();
+  /* Last-resort guard: however sync stalls, the spinner must always stop and
+     say something rather than turning forever with no explanation. */
+  const watchdog=setTimeout(()=>{
+    if(!syncRunning)return;
+    syncRunning=false; state.syncing=false;
+    state.syncMsg={ok:false,text:
+      `Sync gave up after 3 minutes${dbxLastStep?" while "+dbxLastStep:""}. `+
+      (idbBlocked?"This device's storage is locked by another open copy of the app — close other tabs or the Home Screen version, then try again. ":"")+
+      "Nothing is lost — your activities are safe on this device."};
+    render();
+  },180000);
   try{
     let added=0,removedHere=0,pushed=0;
 
@@ -1317,6 +1361,8 @@ async function syncNow({push=true}={}){
     state.syncMsg={ok:false,text:msg,reauth:!!e.reauth};
     if(e.reauth)state.showDbx=true;
   }finally{
+    clearTimeout(watchdog);
+    syncRunning=false;
     state.syncing=false; render();
   }
 }
@@ -2131,7 +2177,16 @@ const TABS=[["overview","Overview"],["trends","Trends"],["detail","Detail"],["ne
 function renderSyncBar(){
   const host=$("syncBar"); host.innerHTML="";
   if(state.syncing){
-    host.appendChild(el("div",{class:"sync-bar"},el("span",{class:"txt"},"Syncing with Dropbox…")));
+    host.appendChild(el("div",{class:"sync-bar"},
+      el("span",{class:"txt"},state.syncMsg&&state.syncMsg.ok?state.syncMsg.text:"Syncing with Dropbox…"),
+      el("button",{onclick:()=>{syncRunning=false;state.syncing=false;
+        state.syncMsg={ok:false,text:"Sync stopped. Nothing is lost."};render();}},"Stop")));
+    return;
+  }
+  if(idbBlocked&&state.index.length){
+    host.appendChild(el("div",{class:"sync-bar warn"},
+      el("span",{class:"txt"},"This device's storage is locked by another open copy of the app. Close other tabs or the Home Screen version, then reload."),
+      el("button",{onclick:()=>location.reload()},"Reload")));
     return;
   }
   if(state.syncMsg){
