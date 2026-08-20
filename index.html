@@ -192,7 +192,7 @@ svg{display:block;max-width:100%}
      MINOR — new capability, existing data keeps working
      PATCH — fixes only, no new capability
    1.x ran as a Claude artifact; 2.0.0 is the GitHub Pages rewrite. */
-const APP_VERSION="2.4.3";
+const APP_VERSION="2.4.4";
 const BUILD_DATE="2026-08-20";
 document.getElementById("ver").textContent = "v"+APP_VERSION;
 
@@ -1106,10 +1106,12 @@ async function dbxDownloadJSON(path){
     headers:{Authorization:"Bearer "+tok,"Dropbox-API-Arg":JSON.stringify({path})},
   });
   if(r.status===409) return null;                    // not there yet
-  if(!r.ok) throw dbxError(r.status,await r.text().catch(()=>""),"download");
+  if(!r.ok) throw dbxError(r.status,await r.text().catch(()=>""),"download of "+path);
   return JSON.parse(await r.text());
 }
 async function dbxDownload(){ return dbxDownloadJSON(DBX_FILE); }
+let dbxLastStep="";
+function step(x){dbxLastStep=x;return x;}
 async function dbxUploadJSON(path,payload){
   const tok=await dbxAccessToken();
   const r=await fetch("https://content.dropboxapi.com/2/files/upload",{
@@ -1121,7 +1123,7 @@ async function dbxUploadJSON(path,payload){
     },
     body:JSON.stringify(payload),
   });
-  if(!r.ok) throw dbxError(r.status,await r.text().catch(()=>""),"upload");
+  if(!r.ok) throw dbxError(r.status,await r.text().catch(()=>""),"upload of "+path);
   return true;
 }
 async function dbxUpload(payload){ return dbxUploadJSON(DBX_FILE,payload); }
@@ -1212,19 +1214,27 @@ async function syncNow({push=true}={}){
   try{
     let added=0,removedHere=0,pushed=0;
 
+    step("reading the manifest");
     let manifest=await dbxDownloadJSON(DBX_MANIFEST);
 
     // One-time migration from the old single-file layout.
     if(!manifest){
+      step("reading the previous single-file backup");
       const legacy=await dbxDownloadJSON(DBX_FILE);
       if(legacy&&Array.isArray(legacy.activities)){
         state.syncMsg={ok:true,text:"Reorganising your Dropbox folder — one moment"};render();
+        let done=0;
         for(const en of legacy.activities){
           if(!en.summary||!en.summary.id)continue;
           if(en.points&&en.points.length){
-            await dbxUploadJSON(DBX_ACT(en.summary.id),{v:1,points:encodeTrack(en.points)});
-            if(!state.pointsCache[en.summary.id])idbSet(en.summary.id,encodeTrack(en.points));
+            const enc=encodeTrack(en.points);
+            step("migrating "+en.summary.id);
+            await dbxUploadJSON(DBX_ACT(en.summary.id),{v:1,points:enc});
+            idbSet(en.summary.id,enc);
           }
+          done++;
+          state.syncMsg={ok:true,text:`Reorganising your Dropbox folder — ${done} of ${legacy.activities.length}`};
+          render();
         }
         manifest={kind:"runs-and-walks-manifest",version:3,
           activities:legacy.activities.map(e=>e.summary),
@@ -1244,15 +1254,21 @@ async function syncNow({push=true}={}){
       const known=new Set((manifest&&manifest.activities||[]).map(a=>a.id));
       const remoteTracks=new Set((manifest&&manifest.tracks)||[]);
       for(const a of state.index){
-        const pts=state.pointsCache[a.id];
-        if(!pts||!pts.length)continue;
         if(remoteTracks.has(a.id))continue;          // already up there — tracks never change
-        await dbxUploadJSON(DBX_ACT(a.id),{v:1,points:encodeTrack(pts)});
+        /* Read through IndexedDB, not just memory: after a page reload the
+           in-memory cache is empty, and the old code silently skipped every
+           track — leaving the manifest claiming files that were never uploaded. */
+        let enc=state.pointsCache[a.id]?encodeTrack(state.pointsCache[a.id]):await idbGet(a.id);
+        if(!enc)continue;
+        step("uploading track "+a.id);
+        await dbxUploadJSON(DBX_ACT(a.id),{v:1,points:enc});
         remoteTracks.add(a.id); pushed++;
+        if(pushed%5===0){state.syncMsg={ok:true,text:`Uploading activities… ${pushed} done`};render();}
       }
       for(const id of Object.keys(state.deleted)){
         if(remoteTracks.has(id)){await dbxDelete(DBX_ACT(id));remoteTracks.delete(id);}
       }
+      step("saving the manifest");
       await dbxUploadJSON(DBX_MANIFEST,{
         kind:"runs-and-walks-manifest",version:3,updatedAt:new Date().toISOString(),
         activities:state.index,deleted:state.deleted,restored:state.restored,
@@ -1268,6 +1284,7 @@ async function syncNow({push=true}={}){
     state.syncMsg={ok:true,text:"Synced with Dropbox"+(bits.length?" · "+bits.join(", "):"")};
   }catch(e){
     let msg=e.message||"Sync failed";
+    if(dbxLastStep)msg+=`  (failed while ${dbxLastStep})`;
     if(/failed to fetch|networkerror|load failed/i.test(msg))
       msg="The request never reached Dropbox. If you're online, this is usually a content blocker, VPN or strict tracking protection getting in the way — open Dropbox sync and tap Test connection to see which step fails. Your activities are safe on this device either way.";
     state.syncMsg={ok:false,text:msg,reauth:!!e.reauth};
@@ -2183,6 +2200,28 @@ async function dbxDiagnose(){
     if(r.ok){note("Writing to Dropbox",true); dbxDelete("/.connection-check.json");}
     else note("Writing to Dropbox",false,dbxError(r.status,await r.text().catch(()=>""),"upload").message);
   }catch(e){ note("Writing to Dropbox",false,"The request never completed — usually a content blocker or network filter."); }
+  /* Sync writes into /activities/, and a subfolder can fail where the root
+     succeeds, so check that separately — the previous check missed it. */
+  try{
+    const r=await fetch("https://content.dropboxapi.com/2/files/upload",{method:"POST",
+      headers:{Authorization:"Bearer "+tok,
+        "Dropbox-API-Arg":JSON.stringify({path:"/activities/.connection-check.json",mode:"overwrite",mute:true}),
+        "Content-Type":"application/octet-stream"},
+      body:JSON.stringify({checkedAt:new Date().toISOString()})});
+    if(r.ok){note("Writing into the activities folder",true); dbxDelete("/activities/.connection-check.json");}
+    else note("Writing into the activities folder",false,dbxError(r.status,await r.text().catch(()=>""),"upload").message);
+  }catch(e){ note("Writing into the activities folder",false,"The request never completed."); }
+  /* A realistically sized body — a small one can succeed where 140 KB fails. */
+  try{
+    const big={pad:"x".repeat(150000)};
+    const r=await fetch("https://content.dropboxapi.com/2/files/upload",{method:"POST",
+      headers:{Authorization:"Bearer "+tok,
+        "Dropbox-API-Arg":JSON.stringify({path:"/activities/.size-check.json",mode:"overwrite",mute:true}),
+        "Content-Type":"application/octet-stream"},
+      body:JSON.stringify(big)});
+    if(r.ok){note("Uploading a full-size activity",true); dbxDelete("/activities/.size-check.json");}
+    else note("Uploading a full-size activity",false,dbxError(r.status,await r.text().catch(()=>""),"upload").message);
+  }catch(e){ note("Uploading a full-size activity",false,"The request never completed — a proxy or filter may be blocking larger uploads."); }
   state.diagDone=true;render();
 }
 function renderDbxPanel(){
