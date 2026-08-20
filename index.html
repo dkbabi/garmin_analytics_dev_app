@@ -142,8 +142,29 @@ select.sel{width:100%;appearance:none;-webkit-appearance:none;padding:11px 34px 
 .country-row .cnt{font-size:11px;color:var(--muted)}
 .arow .place{font-size:10px;color:var(--muted)}
 svg{display:block;max-width:100%}
-.mapbox{width:100%;height:260px;border-radius:12px;overflow:hidden;background:var(--bg);
-  border:1px solid var(--border)}
+.mapbox{width:100%;border-radius:12px;overflow:hidden;background:var(--bg);
+  border:1px solid var(--border);transition:height .18s ease}
+.mapbox.s{height:220px}
+.mapbox.m{height:340px}
+.mapbox.l{height:70vh}
+.map-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin-bottom:8px}
+.map-sizes{display:flex;gap:4px}
+.map-size{padding:5px 10px;border-radius:999px;border:1px solid var(--border);
+  background:var(--surface);color:var(--muted);font-size:11.5px;font-weight:700}
+.map-size.active{background:var(--charcoal);color:var(--bg);border-color:var(--charcoal)}
+.map-expand{display:inline-flex;align-items:center;gap:5px;padding:6px 11px;border-radius:999px;
+  border:1px solid var(--border);background:var(--surface);color:var(--charcoal);
+  font-size:11.5px;font-weight:700}
+.map-expand svg{width:13px;height:13px}
+/* Full screen: fixed to the viewport, above the tab bar, respecting the notch. */
+.map-full{position:fixed;inset:0;z-index:200;background:var(--bg);display:flex;flex-direction:column}
+.map-full .bar{display:flex;align-items:center;justify-content:space-between;gap:10px;
+  padding:calc(10px + env(safe-area-inset-top)) 14px 10px;background:var(--surface);
+  border-bottom:1px solid var(--border)}
+.map-full .bar .ttl{font-size:13px;font-weight:700;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.map-full .mapbox{flex:1;height:auto;border-radius:0;border:none}
+.map-full .foot{padding:8px 14px calc(10px + env(safe-area-inset-bottom));
+  background:var(--surface);border-top:1px solid var(--border);font-size:11px;color:var(--muted)}
 .leaflet-container{font-family:'Albert Sans',system-ui,sans-serif;background:var(--bg)}
 .map-toggle{display:flex;gap:6px;margin-bottom:8px}
 .map-note{font-size:11px;color:var(--muted);margin-top:6px;line-height:1.45}
@@ -174,6 +195,7 @@ svg{display:block;max-width:100%}
 <div id="clearPanel"></div>
 <div id="dbxPanel"></div>
 <div id="pastePanel"></div>
+<div id="mapFull"></div>
 
 <div style="padding:0 16px 8px;display:flex;gap:14px;flex-wrap:wrap">
   <button class="link-btn" id="linkDbx">Dropbox sync</button>
@@ -197,7 +219,7 @@ svg{display:block;max-width:100%}
      MINOR — new capability, existing data keeps working
      PATCH — fixes only, no new capability
    1.x ran as a Claude artifact; 2.0.0 is the GitHub Pages rewrite. */
-const APP_VERSION="2.5.0";
+const APP_VERSION="2.6.0";
 const BUILD_DATE="2026-08-20";
 document.getElementById("ver").textContent = "v"+APP_VERSION;
 
@@ -216,7 +238,7 @@ const DBX_ACT=id=>`/activities/${id}.json`;     // one file per activity track
 /* ---------------- state ---------------- */
 let state={
   index:[], deleted:{}, restored:{}, showClear:false, dupes:[], diag:null, diagDone:false,
-  mapMode:"map",
+  mapMode:"map", mapSize:"m", mapFull:null,
   tab:"overview", sportFilter:"all", range:"all", geoBusy:false, trendMetric:"pace",
   selectedId:null, year:null, pending:[], pointsCache:{},
   dbx:{appKey:"",refresh:null,account:null}, syncMsg:null, syncing:false,
@@ -840,10 +862,10 @@ function paceSegments(points){
   const ok=paces.filter(x=>x!=null);
   return {pts,paces,avg:ok.length?mean(ok):null};
 }
-function renderMap(host,points){
+function renderMap(host,points,sizeClass){
   const seg=paceSegments(points);
   if(!seg){host.appendChild(el("div",{class:"muted-note"},"No GPS track in this activity."));return;}
-  const box=el("div",{class:"mapbox"});
+  const box=el("div",{class:"mapbox "+(sizeClass||state.mapSize)});
   host.appendChild(box);
   loadLeaflet().then(L=>{
     const map=L.map(box,{scrollWheelZoom:false});
@@ -867,6 +889,10 @@ function renderMap(host,points){
       fillColor:C.charcoal,fillOpacity:1}).addTo(map).bindPopup("Finish");
     map.fitBounds(L.latLngBounds(pts.map(p=>[p.la,p.lo])),{padding:[24,24]});
     setTimeout(()=>map.invalidateSize(),80);   // container is sized after insertion
+    setTimeout(()=>map.invalidateSize(),350);  // and again once any size change settles
+    if(window.ResizeObserver){
+      try{ new ResizeObserver(()=>map.invalidateSize()).observe(box); }catch(e){}
+    }
   }).catch(()=>{
     box.remove();
     host.appendChild(routePaced(points));
@@ -1069,6 +1095,8 @@ function loadLocal(){
     if(d)state.dbx={...state.dbx,...JSON.parse(d)};
     const mm=localStorage.getItem("rw:mapmode");
     if(mm)state.mapMode=mm;
+    const ms=localStorage.getItem("rw:mapsize");
+    if(ms)state.mapSize=ms;
   }catch(e){}
 }
 /* ---- reverse geocoding via OpenStreetMap Nominatim ----
@@ -1891,6 +1919,19 @@ function viewDetail(){
     });
     card.appendChild(toggle);
   }
+  if(hasGPS&&state.mapMode==="map"){
+    const sizes=el("div",{class:"map-sizes"});
+    [["s","S"],["m","M"],["l","L"]].forEach(([k,lbl])=>{
+      sizes.appendChild(el("button",{class:"map-size"+(state.mapSize===k?" active":""),
+        onclick:()=>{state.mapSize=k;
+          try{localStorage.setItem("rw:mapsize",k);}catch(e){}
+          render();}},lbl));
+    });
+    card.appendChild(el("div",{class:"map-head"},sizes,
+      el("button",{class:"map-expand",onclick:()=>openMapFull(a.id)},
+        el("span",{html:'<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><polyline points="15 3 21 3 21 9"/><polyline points="9 21 3 21 3 15"/><line x1="21" y1="3" x2="14" y2="10"/><line x1="3" y1="21" x2="10" y2="14"/></svg>'}),
+        "Full screen")));
+  }
   const mapWrap=el("div");
   if(hasGPS&&state.mapMode==="map"){
     renderMap(mapWrap,pts);
@@ -2449,6 +2490,47 @@ function renderDbxPanel(){
   if(state.dbxStatus) card.appendChild(el("p",{class:"status "+(state.dbxStatus.ok?"ok":"err")},state.dbxStatus.text));
   host.appendChild(card);
 }
+/* Full-screen map. Rendered outside the normal view so it can cover the tab bar,
+   and torn down on close so no stray map instance is left running. */
+function renderMapFull(){
+  const host=$("mapFull"); if(!host)return;
+  host.innerHTML="";
+  if(!state.mapFull)return;
+  const a=state.index.find(x=>x.id===state.mapFull);
+  const pts=a?loadPoints(a.id):null;
+  const wrap=el("div",{class:"map-full"});
+  wrap.appendChild(el("div",{class:"bar"},
+    el("div",{class:"ttl"},a?`${fmtDateLong(a.startTime)} · ${fmtKm(a.distanceKm,1)}${a.place?" · "+a.place:""}`:"Route"),
+    el("button",{class:"map-expand",onclick:closeMapFull},"Close")));
+  const body=el("div",{style:{flex:"1",display:"flex",flexDirection:"column",minHeight:"0"}});
+  if(pts&&pts.length)renderMap(body,pts,"");
+  else body.appendChild(el("div",{class:"muted-note"},"Loading the route…"));
+  wrap.appendChild(body);
+  wrap.appendChild(el("div",{class:"foot"},
+    "Teal where you ran faster than this activity's average, clay where slower."));
+  host.appendChild(wrap);
+  document.body.style.overflow="hidden";
+}
+function openMapFull(id){
+  state.mapFull=id;
+  /* Push a history entry so the phone's back gesture closes the map rather than
+     leaving the app. */
+  try{ history.pushState({mapFull:true},""); }catch(e){}
+  render();
+}
+function closeMapFull(){
+  if(!state.mapFull)return;
+  state.mapFull=null;
+  document.body.style.overflow="";
+  render();                       // close immediately, never wait on a history event
+  /* Then unwind the history entry pushed on open, so the back gesture doesn't
+     need an extra tap. popstate re-entering here is harmless: mapFull is null. */
+  if(history.state&&history.state.mapFull){ try{ history.back(); }catch(e){} }
+}
+window.addEventListener("popstate",()=>{
+  if(state.mapFull){state.mapFull=null;document.body.style.overflow="";render();}
+});
+window.addEventListener("keydown",e=>{ if(e.key==="Escape")closeMapFull(); });
 function renderPastePanel(){
   const host=$("pastePanel"); host.innerHTML="";
   if(state.exportText){
@@ -2520,6 +2602,7 @@ function render(){
   $("btnClear").className="icon-btn"+(state.showClear?" danger":"");
   $("btnClear").title="Clear data";
   renderClearPanel();
+  renderMapFull();
   renderSyncBar(); renderToast(); renderDupes(); renderPending(); renderDbxPanel(); renderPastePanel(); renderChips(); renderTabs();
   const main=$("main"); main.innerHTML="";
   if(!state.index.length&&!state.pending.length&&!state.dupes.length){ main.appendChild(renderEmpty()); return; }
